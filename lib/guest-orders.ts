@@ -1,15 +1,26 @@
 import { GUEST_ORDERS_KEY } from "@/lib/constants";
 import type { Order } from "@/types/order";
 
+const EMPTY: Order[] = [];
+let cachedRaw: string | null = null;
+let cachedOrders: Order[] = EMPTY;
+
+/**
+ * Returns the same array (and the same order objects) until storage changes.
+ * useSyncExternalStore snapshots must be referentially stable, otherwise React
+ * re-renders forever ("Maximum update depth exceeded").
+ */
 function read(): Order[] {
-  if (typeof window === "undefined") return [];
+  if (typeof window === "undefined") return EMPTY;
   try {
     const raw = window.localStorage.getItem(GUEST_ORDERS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as Order[];
-    return Array.isArray(parsed) ? parsed : [];
+    if (raw === cachedRaw) return cachedOrders;
+    cachedRaw = raw;
+    const parsed = raw ? (JSON.parse(raw) as Order[]) : EMPTY;
+    cachedOrders = Array.isArray(parsed) ? parsed : EMPTY;
+    return cachedOrders;
   } catch {
-    return [];
+    return EMPTY;
   }
 }
 

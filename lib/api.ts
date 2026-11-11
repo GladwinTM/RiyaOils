@@ -42,7 +42,7 @@ async function sleep(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchOnce<T>(path: string, init: RequestInit): Promise<T> {
+async function fetchOnce<T>(path: string, init: RequestInit, timeoutMs: number): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has("Content-Type") && init.body) {
     headers.set("Content-Type", "application/json");
@@ -51,7 +51,7 @@ async function fetchOnce<T>(path: string, init: RequestInit): Promise<T> {
   if (bearer) headers.set("Authorization", `Bearer ${bearer}`);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const external = init.signal;
   if (external) {
@@ -107,14 +107,26 @@ async function fetchOnce<T>(path: string, init: RequestInit): Promise<T> {
   }
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export type ApiOptions = {
+  /** Per-request timeout; defaults to API_TIMEOUT_MS. */
+  timeoutMs?: number;
+};
+
+export async function api<T>(
+  path: string,
+  init: RequestInit = {},
+  options: ApiOptions = {},
+): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
-  const retries = method === "GET" ? API_RETRY_COUNT : 0;
+  // Writes are only retried when an Idempotency-Key makes repeating them safe.
+  const idempotent = method === "GET" || new Headers(init.headers).has("Idempotency-Key");
+  const retries = idempotent ? API_RETRY_COUNT : 0;
+  const timeoutMs = options.timeoutMs ?? API_TIMEOUT_MS;
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await fetchOnce<T>(path, init);
+      return await fetchOnce<T>(path, init, timeoutMs);
     } catch (error) {
       lastError = error;
       if (attempt >= retries || !isRetryable(error)) break;

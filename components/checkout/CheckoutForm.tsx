@@ -37,12 +37,25 @@ const initial: FormState = {
   pincode: "",
 };
 
+/** crypto.randomUUID needs a secure context; fall back for plain-http LAN testing. */
+function newIdempotencyKey() {
+  const c: Crypto = globalThis.crypto;
+  if (typeof c.randomUUID === "function") return c.randomUUID();
+  const b = c.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 export function CheckoutForm({ settings }: { settings: StoreSettings | null }) {
   const { items, getSubtotal, clearCart, isReady } = useCart();
   const router = useRouter();
   const [form, setForm] = useState(initial);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  // Same key for every attempt at this checkout, so retries can never double-order.
+  const [orderKey] = useState(newIdempotencyKey);
 
   const estimate = useMemo(() => {
     const subtotal = getSubtotal();
@@ -63,6 +76,7 @@ export function CheckoutForm({ settings }: { settings: StoreSettings | null }) {
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    if (pending) return;
     setPending(true);
     try {
       const order = await createOrder({
@@ -79,15 +93,17 @@ export function CheckoutForm({ settings }: { settings: StoreSettings | null }) {
           state: form.state.trim(),
           pincode: form.pincode.trim(),
         },
-      });
+      }, orderKey);
       saveGuestOrder(order);
       clearCart();
       router.push(`/order/${encodeURIComponent(order.order_number)}`);
     } catch (err) {
       setError(
-        err instanceof ApiError
-          ? err.message
-          : "We couldn't place your order. Your cart has not been cleared.",
+        err instanceof ApiError && (err.status === 0 || err.status === 408 || err.status >= 500)
+          ? "The store is slow to respond right now. Press Place order again — you won't be charged or ordered twice."
+          : err instanceof ApiError
+            ? err.message
+            : "We couldn't place your order. Your cart has not been cleared.",
       );
     } finally {
       setPending(false);

@@ -47,10 +47,37 @@ async function detailWith(client: SqlClient, id: string, user?: RequestUser, adm
   return { ...o, items: items.rows, statusHistory: history.rows };
 }
 
-export async function createOrder(dto: CreateOrderInput, user?: RequestUser) {
+async function orderByKey(key: string) {
+  const r = await query<{ id: string }>("select id from orders where idempotency_key=$1", [key]);
+  return r.rows[0] ? detailWith({ query }, r.rows[0].id, undefined, true) : null;
+}
+
+/**
+ * Places an order. With an idempotency key, repeating the request (a retry after a
+ * slow response, a double click) returns the original order instead of a duplicate.
+ */
+export async function createOrder(dto: CreateOrderInput, user?: RequestUser, idempotencyKey?: string) {
   const ids = dto.items.map((i) => i.variantId);
   if (new Set(ids).size !== ids.length) throw badRequest("Each variant can appear only once");
 
+  if (idempotencyKey) {
+    const existing = await orderByKey(idempotencyKey);
+    if (existing) return existing;
+  }
+  try {
+    return await insertOrder(dto, ids, user, idempotencyKey);
+  } catch (error) {
+    // Two identical requests raced; the other one won, so return its order.
+    if (idempotencyKey && (error as { code?: string }).code === "23505") {
+      const existing = await orderByKey(idempotencyKey);
+      if (existing) return existing;
+    }
+    throw error;
+  }
+}
+
+/** One transaction, fixed number of round trips regardless of cart size. */
+function insertOrder(dto: CreateOrderInput, ids: string[], user?: RequestUser, idempotencyKey?: string) {
   return transaction(async (c) => {
     const vr = await c.query<Variant>(
       "select v.*,p.name product_name,p.is_active product_active from product_variants v join products p on p.id=v.product_id where v.id=any($1::uuid[]) for update of v",
@@ -71,8 +98,8 @@ export async function createOrder(dto: CreateOrderInput, user?: RequestUser) {
     if (!sr.rows[0]) throw badRequest("Store settings are not configured", "SETTINGS_NOT_FOUND");
     const shipping = subtotal >= Number(sr.rows[0].free_shipping_threshold) ? 0 : Number(sr.rows[0].shipping_fee);
 
-    const o = await c.query<{ id: string }>(
-      "insert into orders(order_number,user_id,customer_name,customer_phone,customer_email,shipping_address,city,district,state,pincode,subtotal,shipping_fee,total) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning id",
+    const o = await c.query<Order & Record<string, unknown>>(
+      "insert into orders(order_number,user_id,customer_name,customer_phone,customer_email,shipping_address,city,district,state,pincode,subtotal,shipping_fee,total,idempotency_key) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *",
       [
         `RIYA-${Date.now()}`,
         user?.id ?? null,
@@ -87,26 +114,49 @@ export async function createOrder(dto: CreateOrderInput, user?: RequestUser) {
         subtotal,
         shipping,
         subtotal + shipping,
+        idempotencyKey ?? null,
       ],
     );
-    for (const i of dto.items) {
+    const order = o.rows[0];
+
+    // Rows are already locked above, so one batched decrement is safe.
+    const stock = await c.query<{ id: string }>(
+      `update product_variants v set stock = v.stock - x.qty
+       from unnest($1::uuid[], $2::int[]) as x(id, qty)
+       where v.id = x.id and v.stock >= x.qty returning v.id`,
+      [ids, dto.items.map((i) => i.quantity)],
+    );
+    if (stock.rowCount !== ids.length) {
+      const short = map.get(ids.find((id) => !stock.rows.some((r) => r.id === id))!)!;
+      throw badRequest(`Insufficient stock for ${short.product_name} ${short.name}`, "INSUFFICIENT_STOCK");
+    }
+
+    const lines = dto.items.map((i) => {
       const v = map.get(i.variantId)!;
       const price = Number(v.sale_price ?? v.price);
-      const stock = await c.query(
-        "update product_variants set stock=stock-$1 where id=$2 and stock>=$1 returning id",
-        [i.quantity, v.id],
-      );
-      if (!stock.rowCount) throw badRequest(`Insufficient stock for ${v.product_name} ${v.name}`, "INSUFFICIENT_STOCK");
-      await c.query(
-        "insert into order_items(order_id,product_id,variant_id,product_name,variant_name,quantity,unit_price,total_price) values($1,$2,$3,$4,$5,$6,$7,$8)",
-        [o.rows[0].id, v.product_id, v.id, v.product_name, v.name, i.quantity, price, price * i.quantity],
-      );
-    }
-    await c.query(
-      "insert into order_status_history(order_id,status,note,updated_by) values($1,$2,$3,$4)",
-      [o.rows[0].id, "PENDING", "Order placed", user?.id ?? null],
+      return { v, qty: i.quantity, price };
+    });
+    const items = await c.query(
+      `insert into order_items(order_id,product_id,variant_id,product_name,variant_name,quantity,unit_price,total_price)
+       select $1, x.product_id, x.variant_id, x.product_name, x.variant_name, x.qty, x.price, x.qty * x.price
+       from unnest($2::uuid[], $3::uuid[], $4::text[], $5::text[], $6::int[], $7::numeric[])
+         as x(product_id, variant_id, product_name, variant_name, qty, price)
+       returning *`,
+      [
+        order.id,
+        lines.map((l) => l.v.product_id),
+        lines.map((l) => l.v.id),
+        lines.map((l) => l.v.product_name),
+        lines.map((l) => l.v.name),
+        lines.map((l) => l.qty),
+        lines.map((l) => l.price),
+      ],
     );
-    return detailWith(c, o.rows[0].id, user, true);
+    const history = await c.query(
+      "insert into order_status_history(order_id,status,note,updated_by) values($1,$2,$3,$4) returning *",
+      [order.id, "PENDING", "Order placed", user?.id ?? null],
+    );
+    return { ...order, items: items.rows, statusHistory: history.rows };
   });
 }
 

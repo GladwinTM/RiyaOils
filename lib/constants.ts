@@ -7,6 +7,8 @@ export const ACCESS_TOKEN_KEY = "riya-access-token";
 
 export const SEARCH_DEBOUNCE_MS = 350;
 export const API_TIMEOUT_MS = 8_000;
+/** Placing an order does several writes in one transaction; give it room. */
+export const ORDER_TIMEOUT_MS = 30_000;
 export const API_RETRY_COUNT = 2;
 
 export const LOADING_MESSAGES = [

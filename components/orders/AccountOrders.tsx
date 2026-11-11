@@ -22,9 +22,12 @@ function readGuest() {
   return listGuestOrders();
 }
 
+const NO_ORDERS: Order[] = [];
+const noGuestOrders = () => NO_ORDERS;
+
 export function AccountOrders() {
   const storedToken = useSyncExternalStore(subscribe, readToken, () => "");
-  const guest = useSyncExternalStore(subscribe, readGuest, () => []);
+  const guest = useSyncExternalStore(subscribe, readGuest, noGuestOrders);
 
   return <AccountOrdersForm key={storedToken} initialToken={storedToken} guest={guest} />;
 }

@@ -123,7 +123,9 @@ on("GET", "insights/home", () => homeInsights());
 // -------------------------------------------------------------------- orders
 on("POST", "orders", async ({ request, body }) => {
   const input = orderInput(await body());
-  return orders.createOrder(input, await optionalUser(request));
+  const key = request.headers.get("idempotency-key")?.trim() || undefined;
+  if (key && !UUID.test(key)) throw badRequest("Idempotency-Key must be a UUID");
+  return orders.createOrder(input, await optionalUser(request), key);
 }, 201);
 on("GET", "orders", async ({ request }) => orders.listOrdersForUser(await requireUser(request)));
 on("GET", "orders/:id", async ({ request, params }) =>
